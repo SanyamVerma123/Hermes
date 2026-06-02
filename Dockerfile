@@ -1,25 +1,19 @@
 # ============================================================
-#  Hermes Agent — Self-contained Render/HF deployment (Stable v5)
+#  Hermes Agent — Dedicated Render Deployment Build (v5)
 #  Single Dockerfile: Gateway + Dashboard + Chat WebUI + Router
 #
 #  HOW TO DEPLOY ON RENDER:
 #  1. Create a New Web Service on Render (Docker runtime).
-#  2. Connect your GitHub repository containing ONLY this Dockerfile.
-#  3. Set Environment Variables in Render's dashboard (see instructions).
-#  4. Render will build and deploy the container automatically!
-#
-#  URLS:
-#     /            → Chat Web UI (Secure - Redirects to /_login if unauthenticated)
-#     /dashboard   → Hermes Dashboard (Secure - Redirects to /_login if unauthenticated)
-#     /v1/* -> OpenAI-compatible API (Secure - Returns 401 JSON if unauthenticated)
-#     /health      → Status JSON (no auth required for health-checks)
+#  2. Connect the GitHub repository containing ONLY this Dockerfile.
+#  3. Input the required Environment Variables in Render's dashboard.
+#  4. Render will compile and orchestrate the deployment automatically!
 # ============================================================
 
 FROM nousresearch/hermes-agent:latest
 
 USER root
 
-# ── System deps & HF CLI installation ────────────────────────
+# ── 1. SYSTEM UTILITIES & LIGHTWEIGHT DEPENDENCIES ──────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl jq git nodejs npm python3 netcat-openbsd tar gzip unzip dnsutils \
     && rm -rf /var/lib/apt/lists/* \
@@ -29,21 +23,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ( [ -f /root/.local/bin/hf ] && mv /root/.local/bin/hf /usr/local/bin/hf || true ) \
     && chmod +x /usr/local/bin/hf || true
 
-# ── Clone Hermes WebUI (the chat front-end) ──────────────────
+# ── 2. INITIALIZE CHAT FRONTEND (WebUI) ──────────────────────
 RUN git clone --depth 1 https://github.com/nesquena/hermes-webui.git /opt/hermes-webui \
     && ( [ -f /opt/hermes-webui/requirements.txt ] \
-         && /opt/hermes/.venv/bin/pip install --no-cache-dir \
+         && uv pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
             -r /opt/hermes-webui/requirements.txt \
          || true ) \
     && chown -R hermes:hermes /opt/hermes-webui
 
-# ── Node router deps ──────────────────────────────────────────
+# ── 3. ROUTER NETWORKING LAYERS ──────────────────────────────
 RUN mkdir -p /opt/router \
     && cd /opt/router \
     && npm init -y --quiet \
     && npm install --quiet --no-fund http-proxy
 
-# ── Write the Node.js reverse proxy ──────────────────────────
+# ── 4. WRITE ROBUST NODE.JS TRANSPARENT REVERSE PROXY ──────────
 RUN cat > /opt/router/server.js << 'ENDJS'
 'use strict';
 var http  = require('http');
@@ -63,7 +57,6 @@ var GATEWAY_PATHS = [
   '/v1', '/health', '/status'
 ];
 
-// Helper functions for precise path matching
 function isDashboardPath(pathname) {
   for (var i = 0; i < DASHBOARD_PATHS.length; i++) {
     var p = DASHBOARD_PATHS[i];
@@ -103,7 +96,6 @@ proxy.on('error', function(err, req, res) {
   }
 });
 
-// Parse cookies safely
 function parseCookies(req) {
   var out = {};
   var cookieHeader = req.headers.cookie || '';
@@ -118,7 +110,6 @@ function parseCookies(req) {
 function authed(req) {
   if (!GATEWAY_TOKEN) return true;
 
-  // 1. Check Query Token parameter (forces compatibility inside iFrame contexts)
   try {
     var url = req.url || '';
     var qIdx = url.indexOf('?');
@@ -127,6 +118,7 @@ function authed(req) {
       var params = search.split('&');
       for (var i = 0; i < params.length; i++) {
         var pair = params[i].split('=');
+        // FIXED: Check array index pair instead of reference to avoid comparing array to string
         if (pair === 'token' && decodeURIComponent(pair || '') === GATEWAY_TOKEN) {
           return true;
         }
@@ -134,13 +126,11 @@ function authed(req) {
     }
   } catch (e) {}
 
-  // 2. Check Cookie
   var cookies = parseCookies(req);
   if (cookies['hm_tok'] && decodeURIComponent(cookies['hm_tok']) === GATEWAY_TOKEN) {
     return true;
   }
 
-  // 3. Check Authorization header
   var auth = req.headers['authorization'] || '';
   if (auth === 'Bearer ' + GATEWAY_TOKEN) return true;
 
@@ -188,16 +178,14 @@ var server = http.createServer(function(req, res) {
   var url = req.url || '/';
   var referer = req.headers.referer || '';
   
-  // FIX: Properly extract the pathname string (was an array previously, causing healthcheck failures)
+  // FIXED: Properly extract pathname as a clean String index rather than an array
   var pathname = url.split('?');
 
-  // Route: /health check (public - crucial for Render's zero-downtime deploy engine)
   if (pathname === '/health' || pathname === '/health/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, ts: new Date().toISOString(), port: PORT }));
   }
 
-  // Route: /_login page
   if (pathname === '/_login' || pathname === '/_login/') {
     if (req.method === 'POST') {
       var body = '';
@@ -208,7 +196,7 @@ var server = http.createServer(function(req, res) {
           var isHttps = req.headers['x-forwarded-proto'] === 'https' || req.headers['x-forwarded-ssl'] === 'on';
           var cookieFlags = '; Path=/; HttpOnly';
           if (isHttps) {
-            cookieFlags += '; Secure; SameSite=None'; // Support iframe loading fallback
+            cookieFlags += '; Secure; SameSite=None';
           } else {
             cookieFlags += '; SameSite=Lax';
           }
@@ -227,9 +215,7 @@ var server = http.createServer(function(req, res) {
     return res.end(loginPage(''));
   }
 
-  // Mandatory Authentication Check
   if (!authed(req)) {
-    // If request belongs to assets/APIs, return a clean 401 status to prevent WebUI crashes
     var isApiOrAsset = pathname.indexOf('/v1/') === 0 || 
                        pathname.indexOf('/api/') === 0 || 
                        pathname.indexOf('/static/') === 0 ||
@@ -245,13 +231,11 @@ var server = http.createServer(function(req, res) {
     return res.end();
   }
 
-  // Route: Gateway endpoints (Port 8642)
   var isGateway = isGatewayPath(pathname);
   if (isGateway) {
     return proxy.web(req, res, { target: 'http://127.0.0.1:8642', changeOrigin: false });
   }
 
-  // Route: Dashboard endpoints (Port 9119)
   var isDashboard = isDashboardPath(pathname);
   if (!isDashboard && referer) {
     try {
@@ -270,16 +254,16 @@ var server = http.createServer(function(req, res) {
     return proxy.web(req, res, { target: 'http://127.0.0.1:9119', changeOrigin: true });
   }
 
-  // Default Route: WebUI chat interface (Port 8787)
   return proxy.web(req, res, { target: 'http://127.0.0.1:8787', changeOrigin: false });
 });
 
 server.on('upgrade', function(req, socket, head) {
   var url = req.url || '/';
   var referer = req.headers.referer || '';
+  
+  // FIXED: Properly extract pathname as a clean String index rather than an array
   var pathname = url.split('?');
 
-  // Restrict unauthenticated WebSockets
   if (!authed(req)) {
     socket.destroy();
     return;
@@ -311,10 +295,13 @@ server.listen(PORT, '0.0.0.0', function() {
 });
 ENDJS
 
-# ── Write start.sh ────────────────────────────────────────────
+# ── 5. WRITE STARTUP MANAGEMENT SYSTEM ─────────────────────────
 RUN cat > /opt/start.sh << 'ENDSH'
 #!/usr/bin/env bash
 set -euo pipefail
+
+# FIX: Force system-level $HOME variables to protect against Render's dynamic overrides
+export HOME="/home/hermes"
 export PATH="/opt/hermes/.venv/bin:/opt/data/.local/bin:$PATH"
 
 HH="${HERMES_HOME:-/data}"
@@ -322,30 +309,29 @@ HH="${HERMES_HOME:-/data}"
 mkdir -p "$HH" "$HH/logs" "$HH/config" "$HH/memory"
 
 echo "╔══════════════════════════════════════════╗"
-echo "║   Hermes Agent — Render Bootloader       ║"
+echo "║   Hermes Agent — Dedicated Render Boot   ║"
 echo "╚══════════════════════════════════════════╝"
 
-# ── 1. BACKGROUND FRONTEND UPDATES ────────────────────────────
-echo "[boot] 🔄 Checking for WebUI updates in background..."
+# ── Background Frontend Sync ──────────────────────────────────
 (cd /opt/hermes-webui && git pull >/dev/null 2>&1) &
 
-# ── 2. FAST SYNC FROM STORAGE BUCKET ──────────────────────────
+# ── Read Storage Bucket Backup ───────────────────────────────
 if [ -n "${HF_TOKEN:-}" ] && [ -n "${HF_BUCKET:-}" ]; then
-  echo "[boot] 📦 Restoring from Hugging Face Storage Bucket..."
+  echo "[boot] 📦 Synchronizing storage volume with Hugging Face Storage Bucket..."
   export HF_TOKEN="${HF_TOKEN}"
   
   if hf sync "hf://buckets/${HF_BUCKET}" "$HH" \
       --exclude ".venv/*" --exclude "venv/*" --exclude ".cache/*" \
       --exclude "node_modules/*" --exclude "__pycache__/*" --exclude "*.pyc" \
       --exclude "*.log" --exclude "*.tmp" 2>/dev/null; then
-    echo "[boot] ✅ Backup restored instantly"
+    echo "[boot] ✅ Backup layers restored cleanly"
   else
-    echo "[boot] ⚠️ Bucket is empty or connection failed — starting fresh."
+    echo "[boot] ⚠️ Bucket empty or timeout — launching clean local storage container."
   fi
 fi
 
-# ── 3. AUTOMATIC SQLITE INTEGRITY RECOVERY & WAL ENABLING ─────
-echo "[boot] 🩺 Checking database integrity & enabling WAL mode to prevent corruption..."
+# ── Safe Database Verification & WAL Configuration ────────────
+echo "[boot] 🩺 Performing system database structural checks..."
 python3 - <<'PY_SQLITE_RECOVER'
 import os, sqlite3
 db_dir = "/data"
@@ -358,12 +344,12 @@ if os.path.exists(db_dir):
                 cursor = conn.cursor()
                 cursor.execute("PRAGMA integrity_check;")
                 res = cursor.fetchone()
-                # FIX: Check res tuple index correctly to prevent automatic database wipes on boot
+                # FIXED: Check res correctly to prevent false-corruption wipes on restart
                 if res and res == "ok":
                     cursor.execute("PRAGMA journal_mode=WAL;")
                     cursor.execute("PRAGMA synchronous=NORMAL;")
                     conn.commit()
-                    print(f"[boot-recover] Database OK and WAL enabled: {fname}")
+                    print(f"[boot-recover] Database structure is healthy: {fname}")
                 else:
                     raise Exception(f"Integrity check failed: {res if res else 'Unknown'}")
                 conn.close()
@@ -376,11 +362,11 @@ if os.path.exists(db_dir):
                             os.remove(p)
                         except Exception:
                             pass
-                print(f"[boot-recover] Reset corrupted file: {fname}")
+                print(f"[boot-recover] Reset corrupted database: {fname}")
 PY_SQLITE_RECOVER
 
-# ── 4. MERGE BUILT-IN SKILLS INTO PERSISTENT STORAGE ──────────
-echo "[boot] 🧩 Merging 79 built-in skills into persistent storage..."
+# ── Synchronize 79 Built-In Skills ────────────────────────────
+echo "[boot] 🧩 Merging 79 pre-baked skills to persistent storage..."
 for src_skills in /opt/hermes/skills /opt/hermes/hermes_cli/skills /opt/hermes/hermes/skills; do
   if [ -d "$src_skills" ]; then
     mkdir -p "$HH/skills"
@@ -388,8 +374,8 @@ for src_skills in /opt/hermes/skills /opt/hermes/hermes_cli/skills /opt/hermes/h
   fi
 done
 
-# ── 5. INTEGRITY LINKING OF WEBUI SETTINGS ────────────────────
-echo "[boot] ⚙️ Linking WebUI configuration assets..."
+# ── WebUI Session Persistence ──────────────────────────────────
+echo "[boot] ⚙️ Synchronizing Chat WebUI settings..."
 touch "$HH/webui_settings.json"
 if [ ! -s "$HH/webui_settings.json" ]; then
   if [ -f "/opt/hermes-webui/settings.json" ]; then
@@ -401,9 +387,9 @@ fi
 rm -f /opt/hermes-webui/settings.json
 ln -sf "$HH/webui_settings.json" /opt/hermes-webui/settings.json
 
-# ── 6. MERGE AND SYNC ENVIRONMENT CREDENTIALS ─────────────────
+# ── Dynamic Environment Sync Matrix ────────────────────────────
 ENV_FILE="$HH/.env"
-echo "[boot] 🔑 Writing environment configuration..."
+echo "[boot] 🔑 Syncing environment variables..."
 touch "$ENV_FILE"
 
 TMP_ENV=$(mktemp)
@@ -440,17 +426,7 @@ fi
 mv "$TMP_ENV" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
-# ── 7. TELEGRAM INJECTION & DIAGNOSIS ─────────────────────────
-if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-  echo "[boot] 🌐 Checking network reachability to api.telegram.org..."
-  if curl -s -I --connect-timeout 5 "https://api.telegram.org" > /dev/null; then
-    echo "[boot] ✅ Telegram Connection OK"
-  else
-    echo "[boot] ❌ Network Connection WARNING: api.telegram.org unreachable"
-  fi
-fi
-
-# ── 8. CONFIGURATION ENFORCEMENT ──────────────────────────────
+# ── Configuration Enforcement ────────────────────────────────
 CFG="$HH/config.yaml"
 if [ ! -f "$CFG" ]; then
   echo "[boot] ✍️  Writing config.yaml..."
@@ -469,7 +445,7 @@ model:
 YAML
 fi
 
-# Clear any WebUI passwords to avoid user lockouts during setup
+# Reset WebUI password restrictions to avoid token locks
 python3 - <<'PY_PASS_CLEAN'
 import os, json, yaml
 for fpath in ["/data/settings.json", "/data/webui_settings.json", "/opt/hermes-webui/settings.json"]:
@@ -501,8 +477,7 @@ if os.path.exists(cfg_yaml):
         pass
 PY_PASS_CLEAN
 
-# ── 9. PATCH CHAT WEBUI TO ROUTE DASHBOARD ITEMS TO /DASHBOARD ─
-echo "[boot] 🔀 Linking WebUI sidebar directories directly to proxy..."
+# Sidebar Port Realignment Matrix
 python3 - <<'PY_WEBUI_ROUTE_PATCH'
 import os, re
 web_dir = "/opt/hermes-webui"
@@ -528,14 +503,14 @@ for root, _, files in os.walk(web_dir):
                 pass
 PY_WEBUI_ROUTE_PATCH
 
-# ── 10. START SERVICES ─────────────────────────────────────────
+# ── EXECUTE OPERATIONS DAEMONS ────────────────────────────────
 echo "[boot] 🚀 Starting Hermes Gateway (port 8642)..."
 API_SERVER_ENABLED=true \
 API_SERVER_HOST=127.0.0.1 \
 API_SERVER_KEY="${API_SERVER_KEY:-local-dev-key}" \
   hermes gateway run > "$HH/logs/gateway.log" 2>&1 &
 
-echo "[boot] 🗂️  Starting Hermes Dashboard (port 9119)..."
+echo "[boot] 🚀 Starting Hermes Dashboard Control Panel (port 9119)..."
 hermes dashboard \
   --host 0.0.0.0 \
   --port 9119 \
@@ -543,45 +518,22 @@ hermes dashboard \
   --no-open \
   > "$HH/logs/dashboard.log" 2>&1 &
 
-echo "[boot] 🌐 Starting Hermes WebUI (port 8787)..."
+echo "[boot] 🚀 Starting Chat WebUI Interface (port 8787)..."
 cd /opt/hermes-webui
 HERMES_WEBUI_AGENT_DIR=/opt/hermes \
 HERMES_API_KEY="${API_SERVER_KEY:-local-dev-key}" \
 WEBUI_PORT=8787 WEBUI_HOST=127.0.0.1 PORT=8787 \
   python3 server.py > "$HH/logs/webui.log" 2>&1 &
 
-# ── 11. WAIT FOR BACKENDS TO BIND ──────────────────────────────
-echo "[boot] ⏳ Waiting for gateway on :8642..."
-for i in $(seq 1 45); do
-  if nc -z 127.0.0.1 8642 2>/dev/null; then
-    echo "[boot] ✅ Gateway is UP!"
-    break
-  fi
-  sleep 2
-done
+# ── Thread Binding Handshakes ─────────────────────────────────
+for i in $(seq 1 45); do if nc -z 127.0.0.1 8642 2>/dev/null; then break; fi; sleep 2; done
+for i in $(seq 1 45); do if nc -z 127.0.0.1 9119 2>/dev/null; then break; fi; sleep 2; done
+for i in $(seq 1 45); do if nc -z 127.0.0.1 8787 2>/dev/null; then echo "[boot] ✅ Operational threads bound"; break; fi; sleep 2; done
 
-echo "[boot] ⏳ Waiting for dashboard on :9119..."
-for i in $(seq 1 45); do
-  if nc -z 127.0.0.1 9119 2>/dev/null; then
-    echo "[boot] ✅ Dashboard is UP!"
-    break
-  fi
-  sleep 2
-done
-
-echo "[boot] ⏳ Waiting for WebUI on :8787..."
-for i in $(seq 1 45); do
-  if nc -z 127.0.0.1 8787 2>/dev/null; then
-    echo "[boot] ✅ WebUI is UP!"
-    break
-  fi
-  sleep 2
-done
-
-# ── 12. BACKGROUND CLOUD JANITOR ───────────────────────────────
+# ── Background Storage Janitor worker ─────────────────────────
 if [ -n "${HF_TOKEN:-}" ] && [ -n "${HF_BUCKET:-}" ]; then
   (
-    echo "[boot-clean] 🧼 Purging remote junk folders (.venv, .cache) from bucket..."
+    echo "[boot-clean] 🧼 Sweeping garbage folders from remote cloud bucket volume..."
     hf buckets remove "hf://buckets/${HF_BUCKET}/.venv/" --recursive --yes >/dev/null 2>&1 || true
     hf buckets remove "hf://buckets/${HF_BUCKET}/.cache/" --recursive --yes >/dev/null 2>&1 || true
     hf buckets remove "hf://buckets/${HF_BUCKET}/node_modules/" --recursive --yes >/dev/null 2>&1 || true
@@ -596,25 +548,23 @@ if [ -n "${HF_TOKEN:-}" ] && [ -n "${HF_BUCKET:-}" ]; then
   ) &
 fi
 
-# ── 13. START ROUTER ───────────────────────────────────────────
-echo "[boot] 🔀 Starting router on port ${PORT:-10000}..."
+echo "[boot] 🔀 Running traffic director on port ${PORT:-10000}..."
 exec node /opt/router/server.js
 ENDSH
 
 RUN chmod +x /opt/start.sh
 
-# ── Kanban DB idempotent patch ────────────────────────────────
+# ── Kanban DB Idempotent Patch ───────────────────────────────
 RUN python3 - << 'PYPATCH'
 from pathlib import Path
-import sys
+import sys, re
 p = Path("/opt/hermes/hermes_cli/kanban_db.py")
 if not p.exists():
-    print("kanban_db.py not found — skip"); sys.exit(0)
+    sys.exit(0)
 src = p.read_text(encoding="utf-8")
 sentinel = "# hf-patch: idempotent"
 if sentinel in src:
-    print("already patched"); sys.exit(0)
-import re
+    sys.exit(0)
 patched = re.sub(
     r'(conn\.execute\(["\']ALTER TABLE \w+ ADD COLUMN [^)]+\)["\'][ \t]*\))',
     r'try:\n        \1  ' + sentinel + r'\n    except Exception:\n        pass',
@@ -622,19 +572,12 @@ patched = re.sub(
 )
 if patched != src:
     p.write_text(patched, encoding="utf-8")
-    print("kanban patch: applied")
-else:
-    print("kanban patch: pattern not found — may already be fixed upstream")
 PYPATCH
 
-# ── FIX ALL DATABASE FRAGMENTATION & OWNERSHIP ────────────────
-# 1. We pre-create /data
-# 2. We explicitly override the HOME environment variable during container setup so that 
-#    no platform can dynamically override our file-system paths.
+# ── OVERRIDE USER PERMISSIONS FOR RENDER CONTAINERS ──────────
 ENV HOME=/home/hermes
 
-RUN mkdir -p /data /data/logs \
-    && mkdir -p /home/hermes \
+RUN mkdir -p /data /data/logs /home/hermes \
     && rm -rf /home/hermes/.hermes && ln -sf /data /home/hermes/.hermes \
     && rm -rf /opt/data && ln -sf /data /opt/data \
     && chown -R hermes:hermes /data /home/hermes /opt/hermes /opt/hermes-webui /opt/router /opt/start.sh \
