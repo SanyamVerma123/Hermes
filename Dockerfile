@@ -1,9 +1,9 @@
 # ============================================================
-#  Hermes Agent — Self-contained Render deployment (Stable v5)
+#  Hermes Agent — Self-contained Render/HF deployment (Stable v5)
 #  Single Dockerfile: Gateway + Dashboard + Chat WebUI + Router
 #
 #  HOW TO DEPLOY ON RENDER:
-#  1. Create a New Web Service on Render.
+#  1. Create a New Web Service on Render (Docker runtime).
 #  2. Connect your GitHub repository containing ONLY this Dockerfile.
 #  3. Set Environment Variables in Render's dashboard (see instructions).
 #  4. Render will build and deploy the container automatically!
@@ -358,7 +358,7 @@ if os.path.exists(db_dir):
                 cursor = conn.cursor()
                 cursor.execute("PRAGMA integrity_check;")
                 res = cursor.fetchone()
-                # FIX: Check res tuple value to prevent automatic database wipes on boot
+                # FIX: Check res tuple index correctly to prevent automatic database wipes on boot
                 if res and res == "ok":
                     cursor.execute("PRAGMA journal_mode=WAL;")
                     cursor.execute("PRAGMA synchronous=NORMAL;")
@@ -628,13 +628,18 @@ else:
 PYPATCH
 
 # ── FIX ALL DATABASE FRAGMENTATION & OWNERSHIP ────────────────
+# 1. We pre-create /data
+# 2. We explicitly override the HOME environment variable during container setup so that 
+#    no platform can dynamically override our file-system paths.
+ENV HOME=/home/hermes
+
 RUN mkdir -p /data /data/logs \
     && mkdir -p /home/hermes \
     && rm -rf /home/hermes/.hermes && ln -sf /data /home/hermes/.hermes \
     && rm -rf /opt/data && ln -sf /data /opt/data \
     && chown -R hermes:hermes /data /home/hermes /opt/hermes /opt/hermes-webui /opt/router /opt/start.sh \
     && chown -h hermes:hermes /home/hermes/.hermes /opt/data \
-    && chmod -R 777 /data
+    && chmod -R 777 /data /home/hermes
 
 # ── Environment ───────────────────────────────────────────────
 ENV HERMES_HOME=/data \
